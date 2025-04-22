@@ -1,6 +1,18 @@
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+import os
+from dotenv import load_dotenv
+# Load environment variables from .env file
+load_dotenv()
+
+# Retrieve database connection info from environment variables
+db_config = {
+    'host': os.getenv('MYSQL_HOST'),
+    'user': os.getenv('MYSQL_USER'),
+    'password': os.getenv('MYSQL_PASSWORD'),
+    'database': os.getenv('MYSQL_DATABASE')
+}
 
 def ensure_document_types_in_db(categories):
     """
@@ -234,12 +246,7 @@ def get_db_connection():
     # Replace with your actual database connection code
     import mysql.connector
     
-    return mysql.connector.connect(
-        host="localhost",      # Change this if your MySQL server is remote
-        user="root",  # Replace with your MySQL username
-        password="root",  # Replace with your MySQL password
-        database="DocumentProcessing"  # Replace with your database name
-    )
+    return mysql.connector.connect(**db_config)
 
 
 def insert_check_document(document_id, policynumber, loannumber, amount):
