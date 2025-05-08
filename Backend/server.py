@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 # from new import process_directory
 from flask_cors import CORS
-from doc_processor import process_files
+from document_processor import process_files
 import os
 import mysql.connector
 from dbOps import get_db_connection
@@ -34,13 +34,14 @@ def process_docs():
     if 'files' not in request.files:
         return jsonify({"error": "No files provided"}), 400
     file_objects = request.files.getlist('files')
-    results = process_files(file_objects, os.path.join("Files", "JSONs"))
+    results = process_files(file_objects)
     return jsonify(results)
 
 @app.route('/api/get_docs', methods=['GET'])
 def get_documents():
 
     conn = get_db_connection()
+    cursor = conn.cursor()
     sql = """
         SELECT d.id, d.doc_name, b.batch_name, dt.type_name, d.status, d.created_at, d.json
         FROM Documents d
@@ -270,7 +271,7 @@ def get_exceptions():
         JOIN DocumentTypes dt ON d.type_id = dt.id
         JOIN Batches b ON d.batch_id = b.id
         JOIN Exceptions e ON d.id = e.document_id
-        WHERE d.status = 'exception';
+        WHERE d.status = 'exception' and e.resolved = 0;
     """
 
     try:
@@ -314,9 +315,6 @@ def get_exceptions():
     }
     """
 
-    
-
-
 @app.route('/api/processed-documents', methods=['GET'])
 def get_processed_documents():
     conn = get_db_connection()
@@ -333,7 +331,8 @@ def get_processed_documents():
                 WHEN d.status = 'processed' THEN 'Processed'
                 WHEN d.status = 'verified' THEN 'Verified'
                 ELSE d.status
-            END AS status
+            END AS status,
+            d.file
         FROM Documents d
         JOIN DocumentTypes dt ON d.type_id = dt.id
         JOIN Batches b ON d.batch_id = b.id
@@ -400,7 +399,30 @@ def get_batches():
                     WHERE Documents.batch_id = b.id AND Documents.status = 'exception'
                 )
                 ELSE 0
-            END AS exceptions_count
+            END AS exceptions_count,
+            COALESCE(
+                (SELECT SUM(cd.amount) 
+                FROM Documents d
+                JOIN CheckDocuments cd ON d.id = cd.document_id
+                JOIN DocumentTypes dt ON d.type_id = dt.id
+                WHERE d.batch_id = b.id 
+                AND dt.type_name = 'Check'),
+                0
+            ) AS total_check_amount,
+            CASE 
+                WHEN EXISTS (
+                    SELECT 1 
+                    FROM Documents d
+                    JOIN DocumentTypes dt ON d.type_id = dt.id
+                    WHERE d.batch_id = b.id AND dt.type_name = 'Check'
+                ) THEN (
+                    SELECT COUNT(*) 
+                    FROM Documents d
+                    JOIN DocumentTypes dt ON d.type_id = dt.id
+                    WHERE d.batch_id = b.id AND dt.type_name = 'Check'
+                )
+                ELSE 0
+            END AS check_count
         FROM Batches b;
     """
     
@@ -409,7 +431,12 @@ def get_batches():
         rows = cursor.fetchall()
         columns = [desc[0] for desc in cursor.description]
         batches = [dict(zip(columns, row)) for row in rows]
-
+        
+        # Format the decimal amounts to 2 decimal places
+        for batch in batches:
+            if 'total_check_amount' in batch and batch['total_check_amount'] is not None:
+                batch['total_check_amount'] = float(batch['total_check_amount'])
+        
         return jsonify({"batches": batches}), 200
 
     except Exception as e:
@@ -486,6 +513,9 @@ def get_exception_details():
 
 @app.route('/api/update_json', methods=['POST'])
 def update_json():
+    conn = None
+    cursor = None
+    
     try:
         data = request.json
         document_id = data.get('document_id')
@@ -494,37 +524,185 @@ def update_json():
         if not document_id or json_content is None:
             return jsonify({"status_code": 400, "message": "Missing document_id or json_content"}), 400
         
+        # Get database connection
         conn = get_db_connection()
         cursor = conn.cursor()
         
         # Convert JSON object to string for storage
         json_string = json.dumps(json_content)
-        print('1')
-        # Update the document's JSON in the database
-        query = """
-        UPDATE documents 
-        SET documents.json = %s
-        WHERE id = %s
-        """
-        cursor.execute(query, (json_string, document_id))
-        conn.commit()
-
-        cursor.close()
-        conn.close()
         
-        return jsonify({
-            "status_code": 200,
-            "message": "JSON updated successfully",
-            "document_id": document_id
-        })
-    
+        # Check if the document is in exception status
+        cursor.execute("SELECT status FROM Documents WHERE id = %s", (document_id,))
+        document_result = cursor.fetchone()
+        
+        if not document_result:
+            return jsonify({"status_code": 404, "message": "Document not found"}), 404
+        
+        document_status = document_result[0]
+        was_exception = document_status == 'exception'
+        
+        # No need to explicitly start a transaction - MySQL connector automatically 
+        # starts one when you execute the first query after setting autocommit to False
+        conn.autocommit = False
+        
+        try:
+            # Update the document's JSON in the database
+            update_query = """
+            UPDATE Documents 
+            SET json = %s
+            """
+            
+            # If the document was in exception status, update it to processed
+            if was_exception:
+                update_query += ", status = 'processed'"
+                
+            update_query += " WHERE id = %s"
+            
+            cursor.execute(update_query, (json_string, document_id))
+            
+            # If document was in exception status, mark exceptions as resolved
+            if was_exception:
+                cursor.execute("""
+                UPDATE Exceptions
+                SET resolved = 1
+                WHERE document_id = %s
+                """, (document_id,))
+                
+            # Commit the transaction
+            conn.commit()
+            
+            # Prepare response message
+            message = "JSON updated successfully"
+            if was_exception:
+                message += " and document status changed from 'exception' to 'processed'"
+                
+            return jsonify({
+                "status_code": 200,
+                "message": message,
+                "document_id": document_id,
+                "was_exception": was_exception
+            })
+            
+        except Exception as e:
+            # Rollback in case of error
+            if conn:
+                conn.rollback()
+            raise e
+            
     except Exception as e:
         print(f"Error updating JSON: {e}")
         return jsonify({
             "status_code": 500,
             "message": f"Error updating JSON: {str(e)}"
         }), 500
+    finally:
+        # Restore autocommit setting if needed
+        if conn:
+            conn.autocommit = True
+            
+        # Close resources
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
+
+@app.route('/api/document/delete', methods=['DELETE'])
+def delete_document():
+    # Get document_id from request parameters
+    document_id = request.args.get('document_id')
+    
+    # Validate document_id
+    if not document_id:
+        return jsonify({'success': False, 'message': 'document_id is required'}), 400
+    
+    try:
+        document_id = int(document_id)
+    except ValueError:
+        return jsonify({'success': False, 'message': 'document_id must be an integer'}), 400
+    
+    # Connect to database
+    connection = get_db_connection()
+    if not connection:
+        return jsonify({'success': False, 'message': 'Database connection failed'}), 500
+    
+    cursor = connection.cursor()
+    
+    try:
+        # Check if document exists
+        cursor.execute("SELECT id FROM Documents WHERE id = %s", (document_id,))
+        document = cursor.fetchone()
+        
+        if not document:
+            return jsonify({'success': False, 'message': f'Document with id {document_id} not found'}), 404
+        
+        # Delete the document
+        cursor.execute("DELETE FROM Documents WHERE id = %s", (document_id,))
+        connection.commit()
+        
+        if cursor.rowcount > 0:
+            return jsonify({'success': True, 'message': f'Document with id {document_id} deleted successfully'}), 200
+        else:
+            return jsonify({'success': False, 'message': 'Failed to delete document'}), 500
+            
+    except Error as e:
+        connection.rollback()
+        return jsonify({'success': False, 'message': f'Database error: {str(e)}'}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+
+@app.route('/api/batch_details', methods=['GET'])
+def get_batch_details():
+    batch_id = request.args.get('batch_id')
+
+    if not batch_id:
+        return jsonify({'error': 'batch_id is required'}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    query = """
+    SELECT 
+        d.id as document_id,
+        t.type_name as type,
+        d.status
+    FROM Documents d
+    JOIN DocumentTypes t ON d.type_id = t.id
+    WHERE d.batch_id = %s
+    """
+    cursor.execute(query, (batch_id,))
+    documents = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    return jsonify({'documents': documents})
+
+@app.route('/api/batch/delete', methods=['POST'])
+def delete_batch():
+    data = request.json
+    batch_id = data.get('batch_id')
+
+    if not batch_id:
+        return jsonify({'error': 'batch_id is required'}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("DELETE FROM Batches WHERE id = %s", (batch_id,))
+        conn.commit()
+        return jsonify({'message': 'Batch deleted successfully'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
 
 
 

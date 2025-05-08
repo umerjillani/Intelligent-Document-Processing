@@ -137,64 +137,56 @@ def create_batch_in_db(batch_name):
 #         logger.error(f"Database error inserting document: {str(e)}")
 #         raise
 
-def insert_document_in_db(batch_id, doc_name, type_id, status, json_content=None):
+def insert_document_in_db(batch_id, doc_name, type_id, status, file_url=None, json_content=None):
     """
     Insert a document record into the database
-    
+
     Args:
         batch_id: ID of the batch this document belongs to
         doc_name: Name of the document file
         type_id: ID of the document type from DocumentTypes table
         status: Processing status ('pending', 'processed', or 'exception')
+        file_url: S3 URL or path of the file
         json_content: JSON content as string (optional)
-    
+
     Returns:
         int: The ID of the newly created document record
     """
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
+
         if json_content:
             cursor.execute(
                 """
                 INSERT INTO Documents (
-                    batch_id,
-                    doc_name,
-                    type_id,
-                    status,
-                    json
-                ) VALUES (%s, %s, %s, %s, %s)
+                    batch_id, doc_name, type_id, status, file, json
+                ) VALUES (%s, %s, %s, %s, %s, %s)
                 """,
-                (batch_id, doc_name, type_id, status, json_content)
+                (batch_id, doc_name, type_id, status, file_url, json_content)
             )
         else:
             cursor.execute(
                 """
                 INSERT INTO Documents (
-                    batch_id,
-                    doc_name,
-                    type_id,
-                    status
-                ) VALUES (%s, %s, %s, %s)
+                    batch_id, doc_name, type_id, status, file
+                ) VALUES (%s, %s, %s, %s, %s)
                 """,
-                (batch_id, doc_name, type_id, status)
+                (batch_id, doc_name, type_id, status, file_url)
             )
-        
-        # Get the ID of the newly inserted document
+
         conn.commit()
-        cursor.execute(
-            "SELECT LAST_INSERT_ID()"
-        )
+        cursor.execute("SELECT LAST_INSERT_ID()")
         doc_id = cursor.fetchone()[0]
-        
+
         cursor.close()
         conn.close()
-        
+
         return doc_id
     except Exception as e:
         logger.error(f"Database error inserting document: {str(e)}")
         raise
+
 
 def add_exception_in_db(document_id, exception_message):
     """
